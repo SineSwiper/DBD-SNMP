@@ -12,7 +12,7 @@
 package   # hide from PAUSE
    DBD::SNMP::Override;
 
-use common::sense;  # works every time!
+use sanity;
 use Net::SNMP ();
 use Net::SNMP::Dispatcher ();
 use Net::SNMP::Transport ();
@@ -1455,4 +1455,44 @@ sub IDENTIFIER
         return $self->do_err($err);
     }
     return 1;
+}
+
+sub replace_quoted_ids
+{
+    my ( $self, $id ) = @_;
+    return $id unless $self->{struct}->{quoted_ids};
+    if ($id)
+    {
+        if    ( $id =~ /^\?QI(\d+)\?$/ )
+        {
+            return '"' . $self->{struct}->{quoted_ids}->[$1] . '"';
+        }
+        elsif ( $id =~ /^\?QI(\d+)\?.\?QI(\d+)\?$/ )              # double quoted with schema or table name
+        {
+            return join '.', map { '"' . $self->{struct}->{quoted_ids}->[$_] . '"' } ($1, $2);
+        }
+        elsif ( $id =~ /^\?QI(\d+)\?.\?QI(\d+)\?.\?QI(\d+)\?$/ )  # triple quoted with schema AND table name
+        {
+            return join '.', map { '"' . $self->{struct}->{quoted_ids}->[$_] . '"' } ($1, $2, $3);
+        }
+        else
+        {
+            return $id;
+        }
+    }
+    return unless defined $self->{struct}->{table_names};
+    my @tables = @{ $self->{struct}->{table_names} };
+    for my $t (@tables)
+    {
+        if    ( $t =~ /^\?QI(\d+)\?$/ )
+        {
+            $t = '"' . $self->{struct}->{quoted_ids}->[$1] . '"';
+        }
+        elsif ( $t =~ /^\?QI(\d+)\?.\?QI(\d+)\?$/ )  # double quoted with schema
+        {
+            $t = join '.', map { '"' . $self->{struct}->{quoted_ids}->[$_] . '"' } ($1, $2);
+        }
+    }
+    $self->{struct}->{table_names} = \@tables;
+    delete $self->{struct}->{quoted_ids};
 }

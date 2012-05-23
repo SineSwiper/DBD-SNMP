@@ -9,7 +9,7 @@
 package   # hide from PAUSE
    DBD::SNMP::Table;
 
-use common::sense;
+use sanity;
 use warnings 'all';
 use Net::SNMP;
 use DBD::SNMP::Override;
@@ -32,6 +32,15 @@ sub new {
    my $stmt = $sth->{sql_stmt};
    my $t    = $stmt->{tables_by_name}{$table} || $stmt->{tables_by_name}{lc $table};  ### FIXME: Test if name is exactly what is in key
 
+   # SQL::Statement can get tripped up on quotes around RAM tables
+   if ($t->{snmp_specs}{table_type} =~ /^SYSTEM TABLE$|^LOCAL TEMPORARY$/) {
+      $table =~ s/^\w+\.//;
+      my $ram_tbl = $dbh->{sql_ram_tables}{$table};
+      $ram_tbl->seek($sth, 0, 0);
+      $ram_tbl->init_table($sth, $table, $createMode, $lockMode) if ($ram_tbl->can('init_table'));
+      return $ram_tbl;
+   }
+   
    # self additions
    $self->{table_obj} = $t;
    $self->{sth}       = $sth;
@@ -49,7 +58,7 @@ sub new {
    
    my $keys    = $t->{snmp_specs}{keys};
    my $rng_col = $t->{stmt_key_rng_col};
-   my $rcv     = $rng_col and $t->{stmt_key_vals}{ lc($rng_col->{snmp_specs}{name}) };
+   my $rcv     = $rng_col && $t->{stmt_key_vals}{ lc($rng_col->{snmp_specs}{name}) };
    my @opts;
    my $is_req = 0;
 
@@ -68,12 +77,15 @@ sub new {
    # Normally, keys are removed from the OIDs (as _cache_tbl_row will extract them from the result OID, anyway)...
    my @oids  = map { $_->{snmp_specs}{data}{objectID}.$index } grep { $_->{snmp_specs}{data}{objectID} && !$_->{is_key} } @{$t->{stmt_cols}};
    # However, if there's nothing left, just pick one that exists (with the right permissions)
-   @oids = map { $_->{data}{objectID}.$index } first { $_->{data}{objectID} && $_->{data}{access} =~ /Read|Create/ } @{$t->{snmp_specs}{cols}}
-      unless (@oids);
-   return $dbh->set_err($DBI::stderr, "Key-only table '$table' without any SNMP accessible fields", '01007')
+   unless (@oids) {
+      my $obj = first { $_->{data}{objectID} && $_->{data}{access} =~ /Read|Create/ } @{$t->{snmp_specs}{cols}};
+      push(@oids, $obj->{data}{objectID}.$index) if ($obj);
+   }
+   return $dbh->set_err($DBI::stderr, "Table '$table' contains no SNMP readable fields", '01007')
       unless (@oids);
 
    # Figure out what kind of request to send
+   ### TODO: Add partial indexes for OBJECTID, OCTETSTR, NETADDR, IPADDR ###
    given ($t->{stmt_key_abs}) {
       when (-1) {  # Absurd non-true constant condition
          @opts = ();
@@ -145,6 +157,7 @@ sub new {
    if (@opts) {
       foreach my $hostid (sort { $a <=> $b } keys %{$dbh->{snmp_sessions}}) {
          my $session = $dbh->{snmp_sessions}{$hostid};
+
          $is_req ? $session->get_request(
             -callback    => [ \&_cache_req_row, $self, $hostid ],
             @opts,
@@ -183,11 +196,24 @@ sub new {
    return $self->SUPER::new($self);
 }
 
+sub __WARN { 
+   say @_;          # actually print, unlike what the eval hides
+   CORE::warn(@_);  # let CORE::warn do what it has to do
+}
+sub __DIE { 
+   say @_;   # actually print, unlike what the eval hides
+   exit(1);  # really f'ing DIE!
+}
+
 sub fetch_row ($) {
    my ($self, $sth) = @_;
    my $t    = $self->{table_obj};
    my $data = $self->{snmp_data};
    my $dbh  = $sth->{Database};
+
+   # eval bypasses; which will spread like an infection to the Net::SNMP callbacks
+   local $SIG{__WARN__} = \&__WARN;
+   local $SIG{__DIE__}  = \&__DIE;
    
    # (no need for caching a bunch of rows; Net::SNMP::Dispatcher handles transactions well enough)
    ### FIXME: Account for multiple statements ###
@@ -206,96 +232,80 @@ sub fetch_row ($) {
 ######################
 # Net::SNMP callbacks
 
-{
+sub _cache_req_row {
+   my ($session, $self, $hostid) = @_;
+   my $sth = $self->{sth};
 
-   sub __WARN { 
-      say @_;          # actually print, unlike what the eval hides
-      CORE::warn(@_);  # let CORE::warn do what it has to do
-   }
-   sub __DIE { 
-      say @_;   # actually print, unlike what the eval hides
-      exit(1);  # really f'ing DIE!
-   }
-
-   # eval bypasses
-   $SIG{__WARN__} = \&__WARN;
-   $SIG{__DIE__}  = \&__DIE;
-
-   sub _cache_req_row {
-      my ($session, $self, $hostid) = @_;
-      my $sth = $self->{sth};
-
-      if (defined $session->var_bind_list) {
-         my %vbl = %{$session->var_bind_list};
-         my @results = map { ($vbl{$_} =~ /^(noSuchInstance|noSuchObject)$/) ? undef : $vbl{$_} } @{$self->{snmp_oids}};
-         _cache_tbl_row('0', @results, $self, $hostid);
-      }
-
-      return _check_session_errors($session, $self, $hostid);
+   if (defined $session->var_bind_list) {
+      my %vbl = %{$session->var_bind_list};
+      my @results = map { ($vbl{$_} =~ /^(noSuchInstance|noSuchObject)$/) ? undef : $vbl{$_} } @{$self->{snmp_oids}};
+      _cache_tbl_row('0', @results, $self, $hostid);
    }
 
-   sub _cache_tbl_row {
-      # column list comes in after the first passed var, so this gets a little weird
-      my ($index, $hostid, $self) = (shift, pop, pop);
-      my @results = @_;
+   return _check_session_errors($session, $self, $hostid);
+}
 
-      my $t = $self->{table_obj};
-      my $sth = $self->{sth};
-      my $dbh = $sth->{Database};
+sub _cache_tbl_row {
+   # column list comes in after the first passed var, so this gets a little weird
+   my ($index, $hostid, $self) = (shift, pop, pop);
+   my @results = @_;
+
+   my $t = $self->{table_obj};
+   my $sth = $self->{sth};
+   my $dbh = $sth->{Database};
+   
+   my @cols = @{$t->{stmt_cols}};
+   return undef unless (@results && defined $index && $self && $sth);
+   return undef if     (!scalar(grep { defined $_ && $_ ne '' } @results) && $index eq '0' && scalar(@{$t->{snmp_specs}{keys}}));  # empty table result
+
+   my $re = $self->{IndexRegEx};
+   my %index_data;
+   if ($index =~ $$re) { %index_data = %+; }
+   else {
+      $dbh->FETCH('Warn') and $dbh->set_err(0, "WARNING: Index for ".$t->{snmp_specs}{fullname}." didn't match: '$index' =~ /".$$re."/", '42888');
+      return undef;
+   }
+
+   # (Quickly) Analyze the column data
+   my @data;
+   foreach my $c (@cols) {
+      my $data = $c->{colname} eq 'dbi_hostid' ? $hostid :
+                 $c->{is_key}                  ? $index_data{ $c->{snmp_specs}{name} } :
+                                                 shift @results;
       
-      my @cols = @{$t->{stmt_cols}};
-      return undef unless (@results && defined $index && $self && $sth);
-      return undef if     (!scalar(grep { defined $_ && $_ ne '' } @results) && $index eq '0' && scalar(@{$t->{snmp_specs}{keys}}));  # empty table result
-
-      my $re = $self->{IndexRegEx};
-      my %index_data;
-      if ($index =~ $$re) { %index_data = %+; }
-      else {
-         $dbh->FETCH('Warn') and $dbh->set_err(0, "WARNING: Index for ".$t->{snmp_specs}{fullname}." didn't match: '$index' =~ /".$$re."/", '42888');
-         return undef;
-      }
-
-      # (Quickly) Analyze the column data
-      my @data;
-      foreach my $c (@cols) {
-         my $data = $c->{colname} eq 'dbi_hostid' ? $hostid :
-                    $c->{is_key}                  ? $index_data{ $c->{snmp_specs}{name} } :
-                                                    shift @results;
-         
-         # column transforms
-         $data = snmp_transform($c->{snmp_specs}{column_info}[5], $data);  # based on SQL data type
-         
-         push(@data, $data);
-      }
-
-      push(@{$self->{snmp_data}}, \@data);
-      return 1;
+      # column transforms
+      $data = snmp_transform($c->{snmp_specs}{column_info}[5], $data);  # based on SQL data type
+      
+      push(@data, $data);
    }
 
-   sub _check_session_errors {
-      my ($session, $self, $hostid) = @_;
+   push(@{$self->{snmp_data}}, \@data);
+   return 1;
+}
 
-      $self->{snmp_total_queries}[0]--;
+sub _check_session_errors {
+   my ($session, $self, $hostid) = @_;
 
-      # Store error message (if there is one)
-      unless (defined $session && defined $session->var_bind_list) {
-         my $dbh   = $self->{sth}->{Database};
-         my $table = $self->{table_obj}{snmp_specs}{fullname};
-         
-         my $cmd = 'INSERT INTO dbi_snmp.host_errors (hostid, tablename, errormsg, msgtime) VALUES (?, ?, ?, ?)';
-         $dbh->do($cmd, undef, 
-            $hostid, $table, $session->error(), int(time * 100),
-         ) or return $dbh->set_err($DBI::stderr, $dbh->errstr, $dbh->state);
+   $self->{snmp_total_queries}[0]--;
 
-         $dbh->FETCH('Warn') and $dbh->set_err(0, "Net::SNMP Error from table request '$table' for host '".$session->hostname()."': ".$session->error(), '08S01');
-         return undef;
-      }
+   # Store error message (if there is one)
+   unless (defined $session && defined $session->var_bind_list) {
+      my $dbh   = $self->{sth}->{Database};
+      my $table = $self->{table_obj}{snmp_specs}{fullname};
       
-      ### TODO: Add debug status statements from Collector-SNMP.pl ###
-      
-      return 1;
+      my $cmd = 'INSERT INTO dbi_snmp.host_errors (hostid, tablename, errormsg, msgtime) VALUES (?, ?, ?, ?)';
+      $dbh->do($cmd, undef, 
+         $hostid, $table, $session->error(), int(time * 100),
+      ) or return $dbh->set_err($DBI::stderr, $dbh->errstr, $dbh->state);
+
+      $dbh->FETCH('Warn') and $dbh->set_err(0, "Net::SNMP Error from table request '$table' for host '".$session->hostname()."': ".$session->error(), '08S01');
+      return undef;
    }
-};
+   
+   ### TODO: Add debug status statements from Collector-SNMP.pl ###
+   
+   return 1;
+}
 
 ### ALL OPTIONAL FOR NOW! ###
    
