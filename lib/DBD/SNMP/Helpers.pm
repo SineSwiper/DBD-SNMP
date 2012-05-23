@@ -9,7 +9,7 @@
 package   # hide from PAUSE
    DBD::SNMP::Helpers;
 
-use common::sense;  # works every time!
+use sanity;
 use SNMP;
 use List::Util qw(max);
 use POSIX qw(strftime);

@@ -8,7 +8,7 @@
 
 package DBD::SNMP;
 
-use common::sense;  # works every time!
+use sanity;
 use parent qw(DBI::DBD::SqlEngine);
 
 our $VERSION  = "0.50.00";
@@ -60,7 +60,7 @@ package   # hide from PAUSE
    DBD::SNMP::dr;
 $DBD::SNMP::dr::imp_data_size = 0;
 
-use common::sense;  # works every time!
+use sanity;
 
 require DBI::DBD::SqlEngine;
 use parent qw(-norequire DBI::DBD::SqlEngine::dr);
@@ -154,7 +154,7 @@ sub connect ($;$$$$) {
          sql_identifier_case => 2,  # lc
          sql_flags           => {PrintError=>1, RaiseError=>1},
          sql_dialect         => 'SNMP',
-         ( snmp_load_all     => $h->{snmp_load_all} ) x!! exists $h->{snmp_load_all},
+         snmp_load_all       => delete $h->{snmp_load_all},
       }, {});
       $dbh->STORE('Active', 1);
 
@@ -241,11 +241,11 @@ package   # hide from PAUSE
    DBD::SNMP::db;
 $DBD::SNMP::db::imp_data_size = 0;
 
-use common::sense;  # works every time!
+use sanity;
 use SNMP;
 use List::Util qw(reduce first);
 use List::MoreUtils qw(firstidx uniq any none);
-use String::LCSS_XS qw(lcss_all);
+use String::LCSS_XS qw(lcss lcss_all);
 use Storable qw(dclone);
 
 use Net::SNMP;
@@ -440,6 +440,7 @@ sub prepare {
             
          }
          elsif ($cmd eq 'DROP') {
+            ### XXX: This needs to drop more ###
             delete $snmp_specs->{MIB}{$mib}{all}{$tbl};
          }
       }
@@ -502,7 +503,10 @@ sub prepare {
                value   => "$table.".$_->{name},
                type    => 'column',
                sql_loc => $c->{sql_loc},
-            }; } @{$tobj->{cols}} );
+            }; } grep { $_->{data}{access} =~ /Read|Create/ || $_->{tbl}{key}{ $_->{name} } } @{$tobj->{cols}} );
+            
+            return $dbh->set_err($DBI::stderr, "Cannot expand '*' for table '$table': This table is not a SELECT accessible table", '42720')
+               if (@newcols <= 1);  # the single column = dbi_hostid
          }
          
          # replace '*' with new columns, backtrack one, and loop back
@@ -720,6 +724,15 @@ sub snmp_info_load {
    &SNMP::loadModules('ALL');
    &SNMP::initMib();
 
+   # Specs
+   #    mib_lookup  -> [MIB]
+   #    full_lookup -> [OIDObject] (Role)
+   
+   # Specs->MIBQuery->[MIB]
+   
+   # Specs->Full
+   
+   
    $snmp_specs->{MIB}       = {};
    $snmp_specs->{Full}      = {};
    $snmp_specs->{Full}{all} = {};
@@ -741,19 +754,21 @@ sub snmp_info_load {
       my $c  = $o->{children};
       my $e  = $c->[0];
       my $ek = $e  && $e->{children};
-      my $lk = $ek && $ek->[-1];
-      my @oo = grep { $_->{access} ne 'NoAccess' && !arrayref_short_cnt($_->{children}) && $_->{syntax} } @$c;
+      # $e->{children} is not guaranteed to be sorted in correct subID order, so $ek->[-1] doesn't work...
+      # since we are already scanning $ek at this point, might as well do the same thing as @oo...
+      my $lk = $ek && first { $_->{access} ne 'NoAccess' && $_->{syntax} && !arrayref_short_cnt($_->{children}) } @$ek;
+      my @oo =         grep { $_->{access} ne 'NoAccess' && $_->{syntax} && !arrayref_short_cnt($_->{children}) } @$c;
       
       # (can't use $e->{indexes} checks, else this would be easier)
       #                                 (we don't need a total count, just 0, 1, or 2)
       if    ($o->{access} eq 'NoAccess' && !$o->{syntax} &&  arrayref_short_cnt($c)              &&
              $e->{access} eq 'NoAccess' && !$e->{syntax} &&  arrayref_short_cnt($ek)             &&
-            $lk->{access} ne 'NoAccess' && $lk->{syntax} && !arrayref_short_cnt($lk->{children})
+            $lk
       ) {
          # Standard table
          $columns    = $ek;
          $index_link = $e;
-         $table_type = 'TABLE';
+         $table_type = (first { $_->{syntax} ne 'NOTIF' } @$c) ? 'TABLE' : 'NOTIFY OBJECT';
       }
       elsif (!$o->{access} && !$o->{syntax} && @oo) {
          # Global table
@@ -867,36 +882,60 @@ sub snmp_process_indexes {
    my $dbh = shift @_;
    my $good = 1;
    
-   TLOOP: foreach my $tobj (@_) {
+   my @tobj = @_;
+   TLOOP: for (my $i = 0; $i < @tobj; $i++) {  # ol' fashioned loop for array self-modification
+      my $tobj = $tobj[$i];
       next unless ($tobj->{index_link});
       $tobj->{raw_keys} = $tobj->{index_link}{indexes};
       $tobj->{key}  //= {};
       $tobj->{keys} //= [];
       
+      # (an annoyingly large piece of code worth storing)
+      my $lcss_oid = sub {
+         # String::LCSS_XS as a weird bug with passing tied variables (RT #76906), so we have to store them first
+         my $c = $snmp_specs->{Full}{col}{$_[0]}{data}{objectID};
+         my $t = $tobj->{data}{objectID};
+         return length( lcss( $c, $t, 10 ) );
+      };
+   
       foreach my $name ('dbi_hostid', @{$tobj->{raw_keys}}) {
-         my $kobj = $snmp_specs->{Full}{col}{ first { /\.\Q$name\E$/i } keys %{$snmp_specs->{Full}{col}} };
-         unless ($kobj) {
-            $good = $dbh->set_err($dbh->{snmp_load_all} ? '' : 0, "Unknown index key '$name' on table '".$tobj->{name}."'; removing table's existence", '42720');
-            
-            # From now on, this table will have no identifying marks of any kind.  It will not stand out in any way.  It's
-            # entire image is crafted to leave no lasting memory with anyone it encounters.  It's a rumor, recognizable only as
-            # deja vu and dismissed just as quickly.  It doesn't exist; it was never even born.  Anonymity is its name.
-            # Silence its native tongue.  It's no longer part of the System.  It's above the System.  Over it.  Beyond it.
-            # We're "them."  We're "they."  We are the Management Information Base.
-            foreach my $obj (@{$tobj->{cols}}, $tobj) {
-               my ($mib, $name, $full_name) = map { $obj->{$_} } qw(mib name fullname);
-               delete $mib->{$_}{$name}                   for qw(all tbl key col);
-               delete $snmp_specs->{Full}{$_}{$full_name} for qw(all tbl key col);
-               delete $obj->{$_}                          for qw(data mib tbl);
-               
-               $obj = {};
-               $obj = undef;
-               undef $obj;
+         # MIBs like DOCS-QOS-MIB vs. DOCS-QOS3-MIB throw that whole "unique label" assumption out the window...
+         my @poten_labels = grep { /\.\Q$name\E$/i } keys %{$snmp_specs->{Full}{col}};
+
+         unless (@poten_labels) {
+            if ($dbh->{snmp_load_all} && !$tobj->{unknown_index_warning}) {
+               # Maybe we can find it in a later table
+               $dbh->set_err('', "Currently unknown index key '$name' on table '".$tobj->{name}."'; will recheck later...", '42720');
+               $tobj->{unknown_index_warning} = 1;
+               push(@tobj, $tobj);
             }
-            
+            else {
+               $good = $dbh->set_err($dbh->{snmp_load_all} ? '' : 0, "Unknown index key '$name' on table '".$tobj->{name}."'; removing table's existence", '42720');
+               
+               # From now on, this table will have no identifying marks of any kind.  It will not stand out in any way.  It's
+               # entire image is crafted to leave no lasting memory with anyone it encounters.  It's a rumor, recognizable only as
+               # deja vu and dismissed just as quickly.  It doesn't exist; it was never even born.  Anonymity is its name.
+               # Silence its native tongue.  It's no longer part of the System.  It's above the System.  Over it.  Beyond it.
+               # We're "them."  We're "they."  We are the Management Information Base.
+               foreach my $obj (@{$tobj->{cols}}, $tobj) {
+                  my ($mib, $name, $full_name) = map { $obj->{$_} } qw(mib name fullname);
+                  delete $mib->{$_}{$name}                   for qw(all tbl key col);
+                  delete $snmp_specs->{Full}{$_}{$full_name} for qw(all tbl key col);
+                  delete $obj->{$_}                          for qw(data mib tbl);
+                  
+                  $obj = {};
+                  $obj = undef;
+                  undef $obj;
+               }
+            }
             next TLOOP;
          }
-         
+
+         my $label = (@poten_labels == 1) ? $poten_labels[0] :
+            # (in other words, use the matched label with the largest common OID...)
+            (sort { &$lcss_oid($b) <=> &$lcss_oid($a) } @poten_labels)[0];
+            
+         my $kobj      = $snmp_specs->{Full}{col}{$label};
          my $mib       = $kobj->{mibname};
          my $full_name = $kobj->{fullname};
          $kobj->{tbl} ||= $tobj;  # ML
@@ -910,7 +949,10 @@ sub snmp_process_indexes {
          $tobj->{key}{$name} = $kobj;    # ML
          push @{$tobj->{keys}}, $kobj;   # ML
       }
-      $tobj->{cols} = [ sort { $a->{data}{subID} <=> $b->{data}{subID} } uniq(@{$tobj->{keys}}, @{$tobj->{cols}}) ];
+      $tobj->{cols} = [
+         @{$tobj->{keys}},
+         sort { $a->{data}{subID} <=> $b->{data}{subID} } notin($tobj->{keys}, $tobj->{cols})
+      ];
       
       delete $tobj->{raw_keys};
       delete $tobj->{index_link};
@@ -923,33 +965,50 @@ sub arrayref_short_cnt { my $c = $_[0]; return $c->[0] ? ($c->[1] ? 2 : 1) : 0; 
 
 sub snmp_info_reference {
    my ($dbh, $type, $mib, $table, $column, $loose) = @_;
+   #say "SNMP_INFO_REFERENCE: $type, ".join('.', $mib, $table, $column).", $loose" if ($dbh->FETCH('debug'));
+
+   # $type normalization
+   $type = ($type =~ /table/i)      ? 'table_info' :
+           ($type =~ /column/i)     ? 'column_info' :
+           ($type =~ /primary/i)    ? 'primary_key_info' :
+           ($type =~ /foreign/i)    ? 'foreign_key_info' :
+           ($type =~ /statistics/i) ? 'statistics_info' :
+           ($type =~ /load/i)       ? 'load' :
+           $type;
    
    state $snmpLoaded = 0;
    snmp_info_load($dbh) unless ($snmpLoaded);
    $snmpLoaded = 1;
    return undef if ($type =~ /load/i);
-   
+
    # Support wildcards
+   $mib    ||= '%';
+   $table  ||= '%';
+   $column ||= '%';
    my ($mib_re, $table_re, $column_re) = (map { ($type =~ /primary/i) ? quotemeta : sql_wildcard_re($_) } ($mib, $table, $column));
+
+   # Handle cached %.%.% data
+   return $dbh->{snmp_full_sir}{$type}
+      if ("$mib$table$column" eq '%%%' && $dbh->{snmp_full_sir} && $dbh->{snmp_full_sir}{$type});
    
    # Look up the spec objects
    my (@mobj, @tobj, @cobj);
-   if ($mib) {
+   if (!$mib || $mib eq '%') { @mobj = map { $snmp_specs->{MIB}{$_} } sort keys %{$snmp_specs->{MIB}}; }
+   else {
       my $s = $snmp_specs->{MIB};
       my @mib;
       if ($loose) {
          @mib = ($mib)        if ($s->{$mib});
          @mib = ($mib.'_MIB') if (!@mib && $s->{$mib.'_MIB'});
-         @mib = (first { /^$mib_re(?:_MIB)?$/i } keys %$s) if (!@mib);
+         @mib = (first { /^$mib_re(?:_MIB)?$/i } sort keys %$s) if (!@mib);
       }
       else {
-         @mib = grep { /^$mib_re(?:_MIB)?$/i } keys %$s;
+         @mib = grep { /^$mib_re(?:_MIB)?$/i } sort keys %$s;
       }
       return [] unless (@mib);  # don't have any other way of finding it
       @mobj = map { $s->{$_} } @mib;
    }
-   else { @mobj = values %{$snmp_specs->{MIB}}; }
-
+   
    my $hostid_ss = $snmp_specs->{MIB}{dbi_snmp}{key}{dbi_hostid};
    foreach my $pair ([table => $table], [column => $column]) {
       my ($type, $var) = @$pair;
@@ -959,8 +1018,18 @@ sub snmp_info_reference {
 
       my @obj;
       if (!$var || $var eq '%') {
-         @obj = map { @{$_->{$tkey.'s'}} } (@tobj ? @tobj : @mobj);
-         $tbl ? (@tobj = @obj) : (@cobj = ($hostid_ss, @obj));
+         if ($tbl) {
+            @tobj = map {
+               my $m = $_;
+               map { $m->{tbl}{$_} } sort keys %{$m->{tbl}}
+            } @mobj;
+         }
+         else {
+            @cobj = (
+               $hostid_ss, 
+               map { @{$_->{'cols'}} } (@tobj ? @tobj : @mobj),
+            );
+         }
          next;
       };
 
@@ -981,11 +1050,11 @@ sub snmp_info_reference {
             push @obj, map { $o->{$tkey}{$_} } grep { /^$vre$/i } keys %{$o->{$tkey}};
          }
       }
-         
+      
       return [] unless (@obj);  # don't process if it's specific and it fails to match
       $tbl ? (@tobj = @obj) : (@cobj = @obj);
    }
-   
+
    my @dbi_data;
    given ($type) {
       when (/table/i) {
@@ -994,15 +1063,13 @@ sub snmp_info_reference {
             my $tbl = $t->{data};
 
                                   # TABLE_CAT TABLE_SCHEM TABLE_NAME TABLE_TYPE REMARKS
-            $t->{table_info} ||= [ undef, $schema, $table, $t->{table_type} eq 'VIEW' ? 'TABLE' : $t->{table_type}, despace($tbl->{description}) ]; 
+            $t->{table_info} ||= [ undef, $schema, $table, $t->{table_type}, despace($tbl->{description}) ]; 
             push @dbi_data, $t->{table_info};
          }
       }
-      when (/column|primary|statistics/i) {
+      when (/column|primary|foreign|statistics/i) {
          my $types = &type_info_all;
          shift(@$types);
-
-         $type = ($type =~ /column/i) ? 'column_info' : ($type =~ /primary/i) ? 'primary_key_info' : 'statistics_info';
          
          snmp_process_indexes($dbh, @tobj) || return [];
          foreach my $t (sort { $a->{name} cmp $b->{name} } sort { $a->{mibname} cmp $b->{mibname} } @tobj) {  # grabbing it here, so that shared keys can still get the real table
@@ -1018,8 +1085,10 @@ sub snmp_info_reference {
             unless ($loose || !$is_full) {
                $t->{column_info}      = [];
                $t->{primary_key_info} = [];
+               $t->{foreign_key_info} = [];
                $t->{statistics_info}  = [];
             }
+            my $pk_ord_pos = 0;
             foreach my $ord_pos (1 .. @{$t->{cols}}) {
                my $c = $t->{cols}[$ord_pos-1];
                my ($col, $colname) = map { $c->{$_} } qw(data name);
@@ -1032,7 +1101,7 @@ sub snmp_info_reference {
                my $is_key  = $t->{key}{$colname};
                my $is_null = $is_key ? 0 : $ti->[6];
 
-               $c->{column_info} //= [
+               $c->{column_info} = [
                   # 0=TABLE_CAT TABLE_SCHEM TABLE_NAME COLUMN_NAME DATA_TYPE TYPE_NAME COLUMN_SIZE BUFFER_LENGTH DECIMAL_DIGITS
                   undef, $schema, $table, $colname, $ti->[0], $col->{syntax}, $ti->[2], undef, $ti->[17] ? int($ti->[14] * log($ti->[17])/log(10)) : undef,  # log(r^l) = l * log(r)
                   # 9=NUM_PREC_RADIX NULLABLE REMARKS COLUMN_DEF SQL_DATA_TYPE SQL_DATETIME_SUB CHAR_OCTET_LENGTH ORDINAL_POSITION IS_NULLABLE
@@ -1045,43 +1114,131 @@ sub snmp_info_reference {
                push @{$t->{column_info}}, $c->{column_info} unless ($loose || !$is_full);
                   
                if ($is_key && $is_full && !$loose) {
-                  $c->{primary_key_info} //= [
-                     # TABLE_CAT TABLE_SCHEM TABLE_NAME COLUMN_NAME KEY_SEQ PK_NAME
-                     undef, $schema, $table, $colname, $ord_pos, $table.'_pk'
-                  ];
-                  push @{$t->{primary_key_info}}, $c->{primary_key_info};
-
-                  $c->{statistics_info} //= [
-                     # TABLE_CAT TABLE_SCHEM TABLE_NAME NON_UNIQUE INDEX_QUALIFIER INDEX_NAME TYPE ORDINAL_POSITION
-                     # COLUMN_NAME ASC_OR_DESC CARDINALITY PAGES FILTER_CONDITION
-                     undef, $schema, $table, 0, undef, $table.'_pk', 'btree', $ord_pos,
-                     $colname, 'A', undef, undef, undef
-                  ];
-                  push @{$t->{statistics_info}}, $c->{statistics_info};
-                  
-                  push @dbi_data, $c->{$type};
+                  # Due to conflicting key names, col objects cannot have their own pk/stat_info objects
+                  my $o = {
+                     column_info      => $c->{column_info},
+                     primary_key_info => [
+                        # TABLE_CAT TABLE_SCHEM TABLE_NAME COLUMN_NAME KEY_SEQ PK_NAME
+                        undef, $schema, $table, $colname, ++$pk_ord_pos, $table.'_pk'
+                     ],
+                     statistics_info  => [
+                        # TABLE_CAT TABLE_SCHEM TABLE_NAME NON_UNIQUE INDEX_QUALIFIER INDEX_NAME TYPE ORDINAL_POSITION
+                        # COLUMN_NAME ASC_OR_DESC CARDINALITY PAGES FILTER_CONDITION
+                        undef, $schema, $table, 0, undef, $table.'_pk', 'btree', $pk_ord_pos,
+                        $colname, 'A', undef, undef, undef
+                     ],
+                  };
+                  push @{$t->{primary_key_info}}, $o->{primary_key_info};
+                  push @{$t->{statistics_info}},  $o->{statistics_info};
+                  push @dbi_data, $o->{$type} unless ($type =~ /foreign|statistics/i);
                }
                elsif ($type =~ /column/i) { push @dbi_data, $c->{column_info}; }
             }
-            next if ($loose || !$is_full);
-            next if ($t->{table_type} eq 'VIEW');  # can't have a non-hostid index for a global table
             
-            # add non-hostid index
-            my $index = dclone($t->{statistics_info});
-            push @{$t->{statistics_info}}, (map {
-               $_->[3] = 1;                     # NON_UNIQUE
-               $_->[5] = $table.'_snmp_index';  # INDEX_NAME
-               $_->[7]--;                       # ORDINAL_POSITION
-               $_;
-            } grep { $_->[7] > 1 } @$index);
-            @dbi_data = @{$t->{statistics_info}} if ($type =~ /statistics/i);
+            # FKI: every table shouldn't relate to every global table
+            # -AND- 
+            # SI: can't have a non-hostid index for a global table
+            unless ($loose || !$is_full || $t->{table_type} =~ /VIEW|LOCAL TEMPORARY/) {
+               ### FOREIGN_KEY_INFO: Add linkages between primary key and other PKs/columns ###
+               
+               # Treat dbi_snmp::hosts special
+               if ($t->{fullname} eq 'dbi_snmp.hosts') {
+                  my $tbl_list = snmp_info_reference($dbh, 'table');
+                  
+                  foreach my $tbl (sort grep { $_->[3] !~ /LOCAL TEMPORARY/ } @$tbl_list) {
+                     my $fk_key = $tbl->[1].'_'.$tbl->[2];
+                     next if ($fk_key eq 'dbi_snmp_hosts');
+
+                     push @{$t->{foreign_key_info}}, [
+                        # 0=PKTABLE_CAT PKTABLE_SCHEM PKTABLE_NAME PKCOLUMN_NAME FKTABLE_CAT FKTABLE_SCHEM FKTABLE_NAME FKCOLUMN_NAME
+                        undef, 'dbi_snmp', 'hosts', 'hostid', @$tbl[0 .. 2], ($tbl->[3] eq 'SYSTEM TABLE' ? 'hostid' : 'dbi_hostid'),
+                        # 8=KEY_SEQ UPDATE_RULE DELETE_RULE FK_NAME PK_NAME DEFERRABILITY UNIQUE_OR_PRIMARY
+                        1, 3, 3, "dbi_hostid_for_$fk_key", 'hosts_pk', 7, 'PRIMARY',
+                     ];
+                  }
+                  push(@dbi_data, @{$t->{$type}}) if ($type =~ /foreign|statistics/i);
+                  next;
+               }
+               
+               # All of these linkages must fully match the current PK, so we start off trying to find
+               # the last column in other tables.
+               my $pk_list = dclone($t->{primary_key_info});
+               shift @$pk_list;  # dbi_hostid
+               my $pk_last_col = pop @$pk_list;
+               $pk_last_col = $pk_last_col && $pk_last_col->[3];
+               
+               my $col_list = [];
+               push (@$col_list, @{ snmp_info_reference($dbh, 'column', undef, undef, $pk_last_col) } );
+               $pk_last_col = '%'.ucfirst($pk_last_col);  # this includes partial matches (like prefixBlahBlahBlahIfIndex)
+               push (@$col_list, @{ snmp_info_reference($dbh, 'column', undef, undef, $pk_last_col) } );
+               
+               # building the FK list
+               # (adding the column as a key, since the possibility exists that, say, a DwnIfIndex and UpIfIndex exist on the same table)
+               my $fk_list = {
+                  map  { $_->[1].'::'.$_->[2].'::'.$_->[3] => [ $_ ] }
+                  grep { $_->[1].'.'.$_->[2] ne $t->{fullname} }
+                  uniq @$col_list
+               };
+               
+               # Now we have to filter down to tables that match the other keys, too
+               while ($pk_last_col = pop @$pk_list) {
+                  $pk_last_col = $pk_last_col && $pk_last_col->[3];
+                  my $this_col_list = [];
+                  push (@$this_col_list, @{ snmp_info_reference($dbh, 'column', undef, undef, $pk_last_col) } );
+                  $pk_last_col = '%'.ucfirst($pk_last_col);
+                  push (@$this_col_list, @{ snmp_info_reference($dbh, 'column', undef, undef, $pk_last_col) } );
+
+                  # adding the new columns to the FK list
+                  foreach my $col (uniq @$this_col_list) {
+                     my $fk_tbl = $col->[1].'::'.$col->[2];
+                     unshift(@{$fk_list->{$_}}, $col) for (grep { /^\Q$fk_tbl\E::/ } keys %$fk_list);
+                  }
+               };
+
+               # Final FK list building
+               my $pk = $t->{primary_key_info};
+               foreach my $fk_key (sort keys %$fk_list) {
+                  my $fk = $fk_list->{$fk_key};
+                  unshift @$fk, [ @{$fk->[0]}[0 .. 2], 'dbi_hostid' ];
+                  next unless (scalar @$fk == scalar @$pk);  # didn't make the cut
+
+                  $fk_key =~ s/::/_/g;
+                  my $fkey_name = $pk->[0][2]."_fkey_for_$fk_key";
+
+                  for my $r (0 .. @$pk-1) {
+                     my ($p, $f) = ($pk->[$r], $fk->[$r]);
+                     
+                     push @{$t->{foreign_key_info}}, [
+                        # 0=PKTABLE_CAT PKTABLE_SCHEM PKTABLE_NAME PKCOLUMN_NAME FKTABLE_CAT FKTABLE_SCHEM FKTABLE_NAME FKCOLUMN_NAME
+                        @$p[0 .. 3], @$f[0 .. 3],
+                        # 8=KEY_SEQ UPDATE_RULE DELETE_RULE FK_NAME PK_NAME DEFERRABILITY UNIQUE_OR_PRIMARY
+                        $r+1, 3, 3, $fkey_name, $p->[5], 7, 'PRIMARY',
+                     ];
+                  }
+               }
+               
+               ### STATISTICS_INFO: Add non-hostid index ###
+               my $index = dclone($t->{statistics_info});
+               push @{$t->{statistics_info}}, (map {
+                  $_->[3] = 1;                     # NON_UNIQUE
+                  $_->[5] = $table.'_snmp_index';  # INDEX_NAME
+                  $_->[7]--;                       # ORDINAL_POSITION
+                  $_;
+               } grep { $_->[7] > 1 } @$index);
+            }
+
+            push(@dbi_data, @{$t->{$type}}) if ($type =~ /foreign|statistics/i);
          }
       }
-      when (/foreign/i) { die "Cannot query for foreign key info here"; }
       default { die "Wrong type '$type'"; }
    }
-   
-   ### FIXME: Make sure the order is correct (according to DBI) ###
+
+   # Since the potential exists for us to be asked for entire sets of %.%.% data
+   # multiple times, we will just cache the whole thing once.
+   if (!$loose && "$mib$table$column" eq '%%%') {
+      $dbh->{snmp_full_sir}        //= {};
+      $dbh->{snmp_full_sir}{$type} //= \@dbi_data;
+   }
 
    return \@dbi_data;
 }
@@ -1158,113 +1315,18 @@ sub foreign_key_info {
       KEY_SEQ UPDATE_RULE DELETE_RULE FK_NAME PK_NAME DEFERRABILITY UNIQUE_OR_PRIMARY
    )];
 
+   return sponge_sth_loader($dbh, $type, $names, []) unless ($pk_table || $fk_table);
+
    # Need to process the entire indexes list at this point (speed hit be damned)
    state $indexesLoaded = $dbh->{snmp_load_all};
    snmp_process_indexes($dbh, values %{$snmp_specs->{Full}{tbl}}) unless ($indexesLoaded);
    $dbh->{snmp_load_all} = $indexesLoaded = 1;
-   
-   my $pkt = $pk_table && snmp_info_reference($dbh, 'primary', $pk_schema, $pk_table);
-   my $fkt = $fk_table && snmp_info_reference($dbh, 'primary', $fk_schema, $fk_table);
-   my ($pk_list, $fk_list) = ([$pkt], [$fkt]);
-   my $fc_names_list = [];
-   my @dbi_data;
 
-   # find the common prefix 
-   my $ft = $snmp_specs->{Full}{tbl}{$fkt->[0][1].'.'.$fkt->[0][2]} || return sponge_sth_loader($dbh, $type, $names, []);
-   my @fnames = sort map { $_->{name} } grep { $_->{type} ne 'key' } (@{$ft->{cols}}, $ft);
-   my %lcss_cnt;
-   for my $n1 (0 .. @fnames-1) {
-      for my $n2 ($n1+1 .. @fnames-1) {
-         $lcss_cnt{$_->[0]}++ for (grep { $_->[1]+$_->[2] == 0 } lcss_all($fnames[$n1], $fnames[$n2], 2));
-      }
-   }
-   pop @fnames;  # remove table name
-   # most popular string, with shortest length in case of tie-breakers
-   my $lcss = (sort { $lcss_cnt{$b} <=> $lcss_cnt{$a} } sort { length($a) <=> length($b) } keys %lcss_cnt)[0];
-   
-   # If both PKT and FKT are given, the function returns the foreign key, if any,
-   # in table FKT that refers to the primary (unique) key of table PKT.
-   if ($pkt && $fkt) {
-      # nothing; everything is already set up as ([$pkt], [$fkt])
-   }
-   # If only PKT is given, then the result set contains the primary key of that table
-   # and all foreign keys that refer to it.
-   elsif ($pkt) {
-      # first, look for any tables with that first column name
-      ### FIXME: The first column name is dbi_hostid, so this will grab everything... ###
-      my $tbl_list = snmp_info_reference($dbh, 'column', undef, undef, $pkt->[0][3]);
+   my $sir = snmp_info_reference($dbh, $type, $pk_schema, $pk_table);  # PKT ? either filtered or not
+   my @dbi_data = $fk_table ?                                          # FKT ? either filtered or not
+      grep { $_->[5] eq $fk_schema && $_->[6] eq $fk_table } @$sir :
+      @$sir;
       
-      # second, grab all of the primary keys for those tables
-      $fk_list = [ map { snmp_info_reference($dbh, 'primary', $_->[1], $_->[2]) } @$tbl_list ];
-   }
-   # If only FKT is given, then the result set contains all foreign keys in that table
-   # and the primary keys to which they refer.
-   elsif ($fkt) {
-      # for the keys, easiest way is to check keys in snmp_specs and the tbl objects that
-      # point differently
-      my $k = $ft->{keys};
-      
-      $pk_list = [
-         map { snmp_info_reference($dbh, 'primary', $_->{tbl}{mibname}, $_->{tbl}{name}) }
-         grep { $_->{tbl} != $ft }  # object comparison should be enough
-         @$k
-      ];
-      
-      # for the columns, this is a more difficult task, as SNMP has its unique name
-      # constraint; so truncate the common column name and hope it matches to a key
-      # (like prefixBlahBlahBlahIfIndex)
-      
-      $fc_names_list->[0] = {};
-      foreach my $name (@fnames) {
-         my $fname = $name;
-         $fname = s/^$lcss//;
-
-         my $csir = snmp_info_reference($dbh, 'column', undef, undef, $fname);
-         next unless (@$csir);
-         
-         my $c = $snmp_specs->{Full}{col}{ $csir->[0][1].'.'.$csir->[0][3] } || next;
-         next unless ($c->{type} eq 'key');
-         
-         $fc_names_list->[0]{ $csir->[0][3] } = $name;
-         push @$pk_list, snmp_info_reference($dbh, 'primary', $c->{tbl}{mibname}, $c->{tbl}{name});
-      }   
-   }
-   else { return sponge_sth_loader($dbh, $type, $names, []); }
-
-   # main loop
-   foreach my $pk (@$pk_list) {
-      my @pkey = map { $_->[3] } @$pk;
-      $pkey[0] = 'dbi_hostid' if ($pkey[0] eq 'hostid');
-
-      for my $i (0 .. @$fk_list-1) {
-         my $fk = $fk_list->[$i];
-         my $fcnl = $fc_names_list->[$i];
-      
-         # part of the foreign key must match all of the primary key
-         my @fkey = foundin( [@pkey], [ (map { $_->[3] } @$fk), (keys %$fcnl) ] );
-         
-         next unless (scalar @pkey == scalar @fkey);
-         next if (@fkey == 1 && $pk->[0][1] ne 'dbi_snmp');  # every table shouldn't relate to every global table
-         
-         my $is_col = scalar @{ foundin( [ keys %$fcnl ], [ @fkey ] ) };
-         my $fkey_name = $pk->[0][2].'_fkey_for_'.$fk->[0][2];
-
-         for my $r (0 .. @$pk-1) {
-            my ($p, $f) = ($pk->[$r], $fk->[0]);
-            my $fname = $is_col ? $fcnl->{$p->[3]} : $p->[3];
-            $fname = 'dbi_hostid' if ($fname eq 'hostid' && $f->[1] ne 'dbi_snmp');
-            
-            push @dbi_data, [
-               # 0=PKTABLE_CAT PKTABLE_SCHEM PKTABLE_NAME PKCOLUMN_NAME FKTABLE_CAT FKTABLE_SCHEM FKTABLE_NAME FKCOLUMN_NAME
-               @$p[0 .. 3], @$f[0 .. 2], $fname,
-               # 8=KEY_SEQ UPDATE_RULE DELETE_RULE FK_NAME PK_NAME DEFERRABILITY UNIQUE_OR_PRIMARY
-               $r+1, 3, 3, $fkey_name, $p->[5], 7, 'PRIMARY',
-            ];
-         }
-      }
-
-   }
-   
    return sponge_sth_loader($dbh, $type, $names, \@dbi_data);
 }
 
@@ -1443,7 +1505,7 @@ package   # hide from PAUSE
    DBD::SNMP::st;
 $DBD::SNMP::st::imp_data_size = 0;
 
-use common::sense;  # works every time!
+use sanity;
 
 require DBI::DBD::SqlEngine;
 use parent qw(-norequire DBI::DBD::SqlEngine::st);
@@ -1456,7 +1518,7 @@ use parent qw(-norequire DBI::DBD::SqlEngine::st);
 package   # hide from PAUSE
    DBD::SNMP::Statement;
 
-use common::sense;  # works every time!
+use sanity;
 use DBD::File;
 use DBD::SNMP::Table;
 use DBD::SNMP::Override;
@@ -1483,7 +1545,7 @@ sub open_table ($$$$$) {
 package   # hide from PAUSE
    DBD::SNMP::GetInfo;
 
-use common::sense;  # works every time!
+use sanity;
 use parent qw(SQL::Statement::GetInfo);
 
 sub sql_keywords {
